@@ -66,3 +66,4 @@ fastlane/README.md
 .kotlin
 
 android_app/gradle/gradle-daemon-jvm.properties
+.tmp/
