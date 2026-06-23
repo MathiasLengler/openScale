@@ -64,3 +64,5 @@ fastlane/README.md
 
 #kotin
 .kotlin
+
+android_app/gradle/gradle-daemon-jvm.properties
