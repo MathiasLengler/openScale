@@ -145,6 +145,7 @@ class SoehnleHandler : ScaleDeviceHandler() {
         //     0x09 <index> ("read history"). openScale previously sent only 0x09, so the
         //     scale answered with empty [01] acks on CHR_SOEHNLE_B and never returned a
         //     0x09 measurement frame on CHR_SOEHNLE_A.
+        logD("Requesting history: select(0x12 idx 02) + read(0x09 idx) for slots 1..7")
         for (i in 1..7) {
             writeTo(SVC_SOEHNLE, CHR_SOEHNLE_CMD, byteArrayOf(0x12, i.toByte(), 0x02), withResponse = true)
             writeTo(SVC_SOEHNLE, CHR_SOEHNLE_CMD, byteArrayOf(0x09, i.toByte()), withResponse = true)
@@ -155,8 +156,11 @@ class SoehnleHandler : ScaleDeviceHandler() {
         if (data.isEmpty()) return
         when (characteristic) {
             CHR_SOEHNLE_A -> handleSoehnleA(data)
+            // Acks / aux frames for the history protocol; the empty [01] ack lands here.
+            CHR_SOEHNLE_B -> logD("CHR_SOEHNLE_B (ack/aux) ${data.toHexPreview(16)}")
             CHR_BATTERY_LEVEL -> handleBattery(data)
-            else -> Unit
+            // Catch anything unexpected (e.g. a live-measurement frame we don't model yet).
+            else -> logD("Unhandled notify chr=$characteristic ${data.toHexPreview(16)}")
         }
     }
 
@@ -171,14 +175,20 @@ class SoehnleHandler : ScaleDeviceHandler() {
 
     private fun handleBattery(value: ByteArray) {
         val level = (value.first().toInt() and 0xFF)
+        logD("Battery level=$level%")
         if (level <= 10) {
             userWarn(R.string.bluetooth_scale_warning_low_battery, level)
         }
     }
 
     private fun handleSoehnleA(value: ByteArray) {
+        logD("CHR_SOEHNLE_A ${value.toHexPreview(20)}")
         // Only handle 0x09 frames of length 15
-        if (value.size != 15 || value[0] != 0x09.toByte()) return
+        if (value.size != 15 || value[0] != 0x09.toByte()) {
+            val op = value.getOrNull(0)?.toInt()?.and(0xFF) ?: -1
+            logD("Ignoring CHR_SOEHNLE_A frame (len=${value.size}, op=0x${op.toString(16)}) — not a 15-byte 0x09 record")
+            return
+        }
 
         val weightKg = ConverterUtils.fromUnsignedInt16Be(value, 9) / 10.0f
         val soehnleUserIndex = (value[1].toInt() and 0xFF)
@@ -191,6 +201,9 @@ class SoehnleHandler : ScaleDeviceHandler() {
 
         val imp5 = ConverterUtils.fromUnsignedInt16Be(value, 11)
         val imp50 = ConverterUtils.fromUnsignedInt16Be(value, 13)
+
+        logD("Decoded 0x09 record: scaleIdx=$soehnleUserIndex weight=${weightKg}kg " +
+                "ts=$year-$month-$day $hour:$minute:$second imp5=$imp5 imp50=$imp50")
 
         val cal: Calendar = GregorianCalendar(TimeZone.getDefault()).apply {
             set(Calendar.YEAR, year)
@@ -235,6 +248,8 @@ class SoehnleHandler : ScaleDeviceHandler() {
             fat = lib.getFat(weightKg, imp50.toFloat())
             muscle = lib.getMuscle(weightKg, imp50.toFloat(), imp5.toFloat())
         }
+        logD("Publishing measurement: userId=$openScaleUserId weight=${m.weight}kg " +
+                "fat=${m.fat}% water=${m.water}% muscle=${m.muscle}%")
         publish(m)
     }
 
