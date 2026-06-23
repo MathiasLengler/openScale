@@ -42,14 +42,18 @@ import java.util.UUID
  * built-in DriverSettings helpers (persisted per device address).
  *
  * Flow on connect:
- *  1) (Optional) Factory reset if we have no known mappings at all.
- *  2) Subscribe Battery and read initial level.
- *  3) Write Current Time.
- *  4) Subscribe User Control Point (UDS).
- *  5) Create/select user on the scale via UCP.
- *  6) Write age, gender, height.
- *  7) Subscribe custom measurement notifications (A/B).
- *  8) Request history for indices 1..7.
+ *  1) Subscribe Battery and read initial level.
+ *  2) Write Current Time.
+ *  3) Write age, gender, height directly (UDS attribute writes; no consent needed).
+ *  4) Subscribe custom measurement notifications (A/B).
+ *  5) For each scale slot 1..7: select the user (0x12 idx 0x02) then request its
+ *     history (0x09 idx); records arrive as 0x09 frames on CHR_SOEHNLE_A.
+ *
+ * Note: the UDS User Control Point (0x2A9F) register/consent operations return
+ * "Op Code Not Supported" on this firmware (BC-CY-E11) and are not needed — confirmed
+ * by an HCI snoop of the official Soehnle app, which downloads history regardless of
+ * whether its consent attempt succeeds. The "select user" step (0x12) is the part the
+ * scale actually requires before it will return any record.
  */
 class SoehnleHandler : ScaleDeviceHandler() {
 
@@ -90,7 +94,6 @@ class SoehnleHandler : ScaleDeviceHandler() {
     private val CHR_CURRENT_TIME = uuid16(0x2A2B)
 
     private val SVC_USER_DATA = uuid16(0x181C)
-    private val CHR_USER_CONTROL_POINT = uuid16(0x2A9F)
     private val CHR_USER_AGE = uuid16(0x2A80)
     private val CHR_USER_GENDER = uuid16(0x2A8C)
     private val CHR_USER_HEIGHT = uuid16(0x2A8E)
@@ -104,17 +107,12 @@ class SoehnleHandler : ScaleDeviceHandler() {
     // --- Lifecycle -----------------------------------------------------------
 
     override fun onConnected(user: ScaleUser) {
-        // (0) Optional: Factory reset if we have no known mappings at all
-        val anyMapped = (1..7).any { loadUserIdForScaleIndex(it) != -1 }
-        if (!anyMapped) {
-            factoryReset()
-        }
-
         // (1) Battery: subscribe + read once
         setNotifyOn(SVC_BATTERY, CHR_BATTERY_LEVEL)
         readFrom(SVC_BATTERY, CHR_BATTERY_LEVEL)
 
-        // (2) Write current time using BluetoothBytesParser (CTS)
+        // (2) Write current time using BluetoothBytesParser (CTS) so the scale stamps
+        //     stored records with the correct date/time.
         val bleBuilder = BluetoothBytesBuilder()
         val calendar = Calendar.getInstance()
         bleBuilder.addUInt16(calendar.get(Calendar.YEAR))
@@ -130,32 +128,25 @@ class SoehnleHandler : ScaleDeviceHandler() {
 
         writeTo(SVC_CURRENT_TIME, CHR_CURRENT_TIME, bleBuilder.build(), withResponse = true)
 
-        // (3) Subscribe to UDS User Control Point for create/select responses
-        setNotifyOn(SVC_USER_DATA, CHR_USER_CONTROL_POINT)
-
-        // (4) Ensure user exists on scale
-        val appUserId = user.id
-        val scaleIndex = loadScaleIndexForAppUser(appUserId)
-        if (scaleIndex == -1) {
-            // Create new scale user
-            // Payload per legacy: [0x01, 0x00, 0x00]
-            writeTo(SVC_USER_DATA, CHR_USER_CONTROL_POINT, byteArrayOf(0x01, 0x00, 0x00), withResponse = true)
-        } else {
-            // Select existing scale user
-            writeTo(SVC_USER_DATA, CHR_USER_CONTROL_POINT, byteArrayOf(0x02, scaleIndex.toByte(), 0x00, 0x00), withResponse = true)
-        }
-
-        // (5-7) Push profile fields
+        // (3) Push profile fields. On the BC-CY-E11 firmware these UDS attribute writes
+        //     succeed *directly*; the UDS User Control Point register/consent operations
+        //     return "Op Code Not Supported" and are NOT required to read measurements
+        //     (confirmed via an HCI snoop of the official Soehnle app), so we skip them.
         writeTo(SVC_USER_DATA, CHR_USER_AGE, byteArrayOf(user.age.toByte()), withResponse = true)
         writeTo(SVC_USER_DATA, CHR_USER_GENDER, byteArrayOf(if (user.gender.isMale()) 0x00 else 0x01), withResponse = true)
         writeTo(SVC_USER_DATA, CHR_USER_HEIGHT, ConverterUtils.toInt16Le(user.bodyHeight.toInt()), withResponse = true)
 
-        // (8) Subscribe to custom A/B notifications
+        // (4) Subscribe to custom measurement/history notifications
         setNotifyOn(SVC_SOEHNLE, CHR_SOEHNLE_A)
         setNotifyOn(SVC_SOEHNLE, CHR_SOEHNLE_B)
 
-        // (9) Request history for indices 1..7
+        // (5) For each scale slot: SELECT the user, then request its history.
+        //     The official app sends 0x12 <index> 0x02 ("select user") *before*
+        //     0x09 <index> ("read history"). openScale previously sent only 0x09, so the
+        //     scale answered with empty [01] acks on CHR_SOEHNLE_B and never returned a
+        //     0x09 measurement frame on CHR_SOEHNLE_A.
         for (i in 1..7) {
+            writeTo(SVC_SOEHNLE, CHR_SOEHNLE_CMD, byteArrayOf(0x12, i.toByte(), 0x02), withResponse = true)
             writeTo(SVC_SOEHNLE, CHR_SOEHNLE_CMD, byteArrayOf(0x09, i.toByte()), withResponse = true)
         }
     }
@@ -164,20 +155,13 @@ class SoehnleHandler : ScaleDeviceHandler() {
         if (data.isEmpty()) return
         when (characteristic) {
             CHR_SOEHNLE_A -> handleSoehnleA(data)
-            CHR_USER_CONTROL_POINT -> handleUserControlPoint(data, user)
             CHR_BATTERY_LEVEL -> handleBattery(data)
             else -> Unit
         }
     }
 
-    protected fun saveUserIdForScaleIndex(scaleIndex: Int) {
-        settingsPutInt("userMap/userIdByIndex/$scaleIndex", -1)
-    }
     protected fun loadUserIdForScaleIndex(scaleIndex: Int): Int =
         settingsGetInt("userMap/userIdByIndex/$scaleIndex", -1)
-
-    protected fun loadScaleIndexForAppUser(appUserId: Int): Int =
-        settingsGetInt("userMap/scaleIndexByAppUser/$appUserId", -1)
 
     protected fun saveScaleIndexForAppUser(appUserId: Int, scaleIndex: Int) {
         settingsPutInt("userMap/scaleIndexByAppUser/$appUserId", scaleIndex)
@@ -189,31 +173,6 @@ class SoehnleHandler : ScaleDeviceHandler() {
         val level = (value.first().toInt() and 0xFF)
         if (level <= 10) {
             userWarn(R.string.bluetooth_scale_warning_low_battery, level)
-        }
-    }
-
-    private fun handleUserControlPoint(value: ByteArray, user: ScaleUser) {
-        if (value.isEmpty() || value[0] != 0x20.toByte()) return
-        val cmd = value.getOrNull(1)?.toInt() ?: return
-        when (cmd) {
-            0x01 -> { // user create
-                val success = value.getOrNull(2) ?: return
-                val idx = value.getOrNull(3)?.toInt() ?: return
-                if (success == 0x01.toByte()) {
-                    saveScaleIndexForAppUser(user.id, idx)
-                    userInfo(R.string.bluetooth_scale_info_step_on_for_reference, 0)
-                } else {
-                    logE("Soehnle: error creating user")
-                }
-            }
-            0x02 -> { // user select
-                val success = value.getOrNull(2) ?: return
-                if (success != 0x01.toByte()) {
-                    logE("Soehnle: error selecting user; attempting create")
-                    // Try to create instead
-                    writeTo(SVC_USER_DATA, CHR_USER_CONTROL_POINT, byteArrayOf(0x01, 0x00, 0x00), withResponse = true)
-                }
-            }
         }
     }
 
@@ -243,15 +202,24 @@ class SoehnleHandler : ScaleDeviceHandler() {
             set(Calendar.MILLISECOND, 0)
         }
 
-        val openScaleUserId = loadUserIdForScaleIndex(soehnleUserIndex)
+        // We need the user's profile for composition calcs; the current app user is also
+        // the fallback owner for a slot we have not mapped yet.
+        val u = try { currentAppUser() } catch (_: Throwable) { null }
+
+        var openScaleUserId = loadUserIdForScaleIndex(soehnleUserIndex)
         if (openScaleUserId == -1) {
-            logE("Unknown Soehnle user index $soehnleUserIndex")
-            return
+            // UDS register is unsupported on this firmware, so the scaleIndex→appUser
+            // mapping is never created the "official" way. Adopt the currently selected
+            // app user for this slot and persist the mapping for next time.
+            if (u == null) {
+                logE("Unknown Soehnle user index $soehnleUserIndex and no current app user")
+                return
+            }
+            openScaleUserId = u.id
+            saveScaleIndexForAppUser(u.id, soehnleUserIndex)
+            logD("Adopted Soehnle index $soehnleUserIndex → appUser ${u.id}")
         }
 
-        // We need user's profile for composition calcs → try to use the currently selected user
-        // (This is usually the same as 'openScaleUserId')
-        val u = try { currentAppUser() } catch (_: Throwable) { null }
         val activity = mapActivityLevel(u)
         val isMale = u?.gender?.isMale() ?: true
         val age = u?.age ?: 30
@@ -271,12 +239,6 @@ class SoehnleHandler : ScaleDeviceHandler() {
     }
 
     // --- Helpers --------------------------------------------------------------
-
-    private fun factoryReset() {
-        logD("Soehnle: factory reset + clear mappings")
-        writeTo(SVC_SOEHNLE, CHR_SOEHNLE_CMD, byteArrayOf(0x0B, 0xFF.toByte()), withResponse = true)
-        for (i in 1..7) saveUserIdForScaleIndex(i)
-    }
 
     private fun mapActivityLevel(user: ScaleUser?): Int = when (user?.activityLevel) {
         ActivityLevel.SEDENTARY -> 0
